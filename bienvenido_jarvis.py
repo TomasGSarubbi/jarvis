@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Double-clap welcome script for Señor Tatay.
+Voice-activated home automation:
+  - Double clap  → opens visualizer + welcome message + plays Spotify
+  - "stop music" → pause Spotify + voice response
+  - Any question → Claude searches the web and answers out loud
 
-Detects 2 claps → voz AI dice bienvenido → abre YouTube → Claude + Cursor lado a lado.
+Dependencies:
+    pip install sounddevice numpy SpeechRecognition pyaudio anthropic pygame
 
-Dependencias:
-    pip install sounddevice numpy pyttsx3
-
-Uso:
-    python bienvenido_tatay.py
+Requires:
+    ANTHROPIC_API_KEY environment variable
 """
 
 import os
@@ -16,217 +17,268 @@ import sys
 import time
 import threading
 import subprocess
-import webbrowser
 
 import numpy as np
 import sounddevice as sd
-import pyttsx3
+import speech_recognition as sr
+import anthropic
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Configuración
+#  Config
 # ──────────────────────────────────────────────────────────────────────────────
-SAMPLE_RATE    = 44100
-BLOCK_SIZE     = int(SAMPLE_RATE * 0.05)   # 50 ms por bloque
-THRESHOLD      = 0.20     # RMS mínimo para contar como aplauso  ← ajusta si falla
-COOLDOWN       = 0.1    # segundos de pausa mínima entre aplausos
-DOUBLE_WINDOW  = 2.0     # ventana de tiempo para el segundo aplauso
+SAMPLE_RATE   = 44100
+BLOCK_SIZE    = int(SAMPLE_RATE * 0.05)
+THRESHOLD     = 0.20
+COOLDOWN      = 0.1
+DOUBLE_WINDOW = 2.0
 
-YOUTUBE_URL    = "https://www.youtube.com/watch?v=hEIexwwiKKU"
-MENSAJE        = "Bienvenido a casa, señor Tatay."
-NEW_PROJECT    = os.path.expanduser("~/Desktop/nuevo_proyecto")
+SPOTIFY_URI = "spotify:track:08mG3Y1vljYA6bvDt4Wqkj"
+MENSAJE     = "Welcome home Sir. What should we do today."
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Estado global
-# ──────────────────────────────────────────────────────────────────────────────
-clap_times: list[float] = []
-triggered = False
-lock = threading.Lock()
-
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Detección de aplausos
+#  Visualizer subprocess proxy
+# ──────────────────────────────────────────────────────────────────────────────
+_viz_proc = None
+
+
+def _viz_send(msg: str):
+    global _viz_proc
+    if _viz_proc is None:
+        return
+    try:
+        _viz_proc.stdin.write(msg + "\n")
+        _viz_proc.stdin.flush()
+    except Exception:
+        pass
+
+
+def start_visualizer():
+    global _viz_proc
+    script = os.path.join(SCRIPT_DIR, "visualizer.py")
+    _viz_proc = subprocess.Popen(
+        [sys.executable, script],
+        stdin=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+
+class _Viz:
+    def set_state(self, s: str):
+        _viz_send(f"state:{s}")
+
+    def set_amplitude(self, rms: float):
+        _viz_send(f"amp:{min(1.0, rms * 6):.3f}")
+
+
+viz = _Viz()
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  State
+# ──────────────────────────────────────────────────────────────────────────────
+clap_times    : list[float] = []
+triggered     = False
+speaking      = False
+music_playing = False
+lock          = threading.Lock()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Clap detection
 # ──────────────────────────────────────────────────────────────────────────────
 def audio_callback(indata, frames, time_info, status):
     global triggered, clap_times
 
-    if triggered:
+    if triggered or speaking:
         return
 
     rms = float(np.sqrt(np.mean(indata ** 2)))
     now = time.time()
 
+    viz.set_amplitude(rms)
+
     if rms > THRESHOLD:
         with lock:
-            # Ignora si estamos en el cooldown del aplauso anterior
             if clap_times and (now - clap_times[-1]) < COOLDOWN:
                 return
 
             clap_times.append(now)
-            # Limpia aplausos fuera de la ventana
             clap_times = [t for t in clap_times if now - t <= DOUBLE_WINDOW]
 
             count = len(clap_times)
-            print(f"  👏  Aplauso {count}/2  (RMS={rms:.3f})")
+            print(f"  Clap {count}/2  (RMS={rms:.3f})")
 
             if count >= 2:
                 triggered = True
                 clap_times = []
-                threading.Thread(target=secuencia_bienvenida, daemon=True).start()
+                threading.Thread(target=run_welcome_sequence, daemon=True).start()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Secuencia de bienvenida
+#  Welcome sequence
 # ──────────────────────────────────────────────────────────────────────────────
-def secuencia_bienvenida():
-    print("\n🚀  Iniciando secuencia de bienvenida…\n")
+def run_welcome_sequence():
+    global music_playing
+    print("\nDouble clap detected!\n")
+    start_visualizer()
+    viz.set_state("listening")
+    speak(MENSAJE)
+    play_spotify()
+    music_playing = True
 
-    hablar(MENSAJE)
-    abrir_youtube()
-    abrir_apps_lado_a_lado()
 
-    print("\n✅  Secuencia completada.\n")
-
-
-def hablar(texto: str):
-    """TTS local con pyttsx3 (usa voces del sistema, sin API key)."""
-    print(f"  🔊  Diciendo: «{texto}»")
-
-    # Primero intenta con el comando 'say' de macOS (mejor calidad)
-    resultado = subprocess.run(
-        ["say", "-v", "Monica", texto],
-        capture_output=True
+def play_spotify():
+    result = subprocess.run(
+        ["osascript", "-e", f'tell application "Spotify" to play track "{SPOTIFY_URI}"'],
+        capture_output=True,
     )
-    if resultado.returncode == 0:
-        return  # éxito con Monica (voz española de macOS)
-
-    # Fallback: pyttsx3
-    engine = pyttsx3.init()
-    voices = engine.getProperty("voices")
-
-    # Busca voz en español
-    esp = [v for v in voices if "es" in v.id.lower() or "spanish" in v.name.lower()]
-    if esp:
-        engine.setProperty("voice", esp[0].id)
-        print(f"     Voz seleccionada: {esp[0].name}")
-    else:
-        print("     Usando voz por defecto (no se encontró voz en español)")
-
-    engine.setProperty("rate", 148)
-    engine.say(texto)
-    engine.runAndWait()
-
-
-def abrir_youtube():
-    print(f"  🎵  Abriendo YouTube…")
-    webbrowser.open(YOUTUBE_URL)
-    time.sleep(1.2)  # deja que el navegador cargue antes de seguir
-
-
-def abrir_apps_lado_a_lado():
-    sw, sh = obtener_resolucion_pantalla()
-    mitad = sw // 2
-
-    # Asegura que existe la carpeta del nuevo proyecto
-    os.makedirs(NEW_PROJECT, exist_ok=True)
-
-    # ── Abre Claude ──────────────────────────────────────────────────────────
-    print("  🤖  Abriendo Claude…")
-    subprocess.Popen(["open", "-a", "Claude"])
-    time.sleep(1.8)
-
-    # ── Abre Cursor con nuevo proyecto ───────────────────────────────────────
-    print("  💻  Abriendo Cursor…")
-    cursor_cmd = encontrar_cursor()
-    if cursor_cmd:
-        subprocess.Popen([cursor_cmd, NEW_PROJECT])
-    else:
-        subprocess.Popen(["open", "-a", "Cursor", NEW_PROJECT])
-    time.sleep(1.8)
-
-    # ── Coloca ventanas lado a lado con AppleScript ──────────────────────────
-    print("  🪟  Organizando ventanas…")
-    applescript = f"""
-    tell application "System Events"
-        try
-            tell process "Claude"
-                set frontmost to true
-                set position of window 1 to {{0, 0}}
-                set size of window 1 to {{{mitad}, {sh}}}
-            end tell
-        end try
-        try
-            tell process "Cursor"
-                set frontmost to true
-                set position of window 1 to {{{mitad}, 0}}
-                set size of window 1 to {{{mitad}, {sh}}}
-            end tell
-        end try
-    end tell
-    """
-    subprocess.run(["osascript", "-e", applescript], capture_output=True)
+    if result.returncode != 0:
+        subprocess.Popen(["open", SPOTIFY_URI])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Utilidades
+#  Voice command listener
 # ──────────────────────────────────────────────────────────────────────────────
-def obtener_resolucion_pantalla() -> tuple[int, int]:
+def voice_command_listener():
+    recognizer = sr.Recognizer()
+    mic        = sr.Microphone()
+
+    print("  Voice commands ready. Say 'stop music' or ask anything.")
+
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+
+    while True:
+        if speaking:
+            time.sleep(0.1)
+            continue
+        try:
+            with mic as source:
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+            text = recognizer.recognize_google(audio).lower()
+            print(f"\n  Heard: \"{text}\"")
+            threading.Thread(target=handle_command, args=(text,), daemon=True).start()
+        except sr.WaitTimeoutError:
+            pass
+        except sr.UnknownValueError:
+            pass
+        except Exception as e:
+            print(f"  Voice error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Command handling
+# ──────────────────────────────────────────────────────────────────────────────
+def handle_command(text: str):
+    global music_playing
+
+    if "shut down" in text or "shutdown" in text:
+        speak("Shutting down. Goodbye Sir.")
+        if _viz_proc:
+            _viz_proc.terminate()
+        os._exit(0)
+    elif "stop music" in text or "stop the music" in text:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Spotify" to pause'],
+            capture_output=True,
+        )
+        music_playing = False
+        speak("Music stopped. What should we do today?")
+    elif music_playing:
+        print(f"  Ignoring (music playing): \"{text}\"")
+    else:
+        print(f"  Asking Claude: {text}")
+        viz.set_state("thinking")
+        answer = ask_claude(text)
+        speak(answer)
+
+
+def ask_claude(question: str) -> str:
     try:
-        out = subprocess.run(
-            ["osascript", "-e",
-             "tell application \"Finder\" to get bounds of window of desktop"],
-            capture_output=True, text=True
-        ).stdout.strip()
-        parts = [int(x.strip()) for x in out.split(",")]
-        return parts[2], parts[3]
-    except Exception:
-        return 1920, 1080
+        client = anthropic.Anthropic()
+        with client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=512,
+            system=[{
+                "type": "text",
+                "text": (
+                    "You are a voice assistant. Search the web when needed, "
+                    "then answer in 2-3 plain sentences with no markdown, "
+                    "no bullet points, and no special characters. "
+                    "Speak naturally as if talking out loud."
+                ),
+                "cache_control": {"type": "ephemeral"},
+            }],
+            tools=[{"type": "web_search_20260209", "name": "web_search"}],
+            messages=[{"role": "user", "content": question}],
+        ) as stream:
+            final = stream.get_final_message()
+            for block in reversed(final.content):
+                if block.type == "text":
+                    return block.text
+        return "I could not find an answer."
+    except Exception as e:
+        print(f"  Claude error: {e}")
+        return "I had trouble getting an answer. Please try again."
 
 
-def encontrar_cursor():
-    """Devuelve la ruta del CLI de Cursor si está disponible."""
-    candidatos = [
-        "/usr/local/bin/cursor",
-        "/opt/homebrew/bin/cursor",
-        os.path.expanduser("~/.cursor/bin/cursor"),
-    ]
-    for path in candidatos:
-        if os.path.isfile(path):
-            return path
-    # Intenta por PATH
-    result = subprocess.run(["which", "cursor"], capture_output=True, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip()
-    return None
+# ──────────────────────────────────────────────────────────────────────────────
+#  TTS
+# ──────────────────────────────────────────────────────────────────────────────
+def speak(text: str):
+    global speaking
+    speaking = True
+    viz.set_state("speaking")
+    print(f"  Saying: {text}")
+    result = subprocess.run(["say", "-v", "Samantha", text], capture_output=True)
+    if result.returncode != 0:
+        subprocess.run(["say", text], capture_output=True)
+    time.sleep(1.0)
+    speaking = False
+    viz.set_state("listening")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Audio loop (background thread)
+# ──────────────────────────────────────────────────────────────────────────────
+def audio_loop():
+    global triggered
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=BLOCK_SIZE,
+        channels=1,
+        dtype="float32",
+        callback=audio_callback,
+    ):
+        while True:
+            time.sleep(0.1)
+            if triggered:
+                time.sleep(5)
+                triggered = False
+                print("\nListening again...\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
-    global triggered
+    print("=" * 50)
+    print("  Listening for claps... (Ctrl+C to quit)")
+    print(f"  Threshold: {THRESHOLD}  (adjust THRESHOLD if needed)")
+    print("=" * 50)
 
-    print("=" * 55)
-    print("  🎤  Escuchando aplausos… (Ctrl+C para salir)")
-    print(f"  Umbral actual: {THRESHOLD}  (ajusta THRESHOLD si falla)")
-    print("=" * 55)
+    threading.Thread(target=voice_command_listener, daemon=True).start()
+    threading.Thread(target=audio_loop, daemon=True).start()
 
     try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SIZE,
-            channels=1,
-            dtype="float32",
-            callback=audio_callback,
-        ):
-            while True:
-                time.sleep(0.1)
-                if triggered:
-                    # Espera a que la secuencia acabe y vuelve a escuchar
-                    time.sleep(8)
-                    triggered = False
-                    print("\n👂  Escuchando de nuevo…\n")
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n\nHasta luego! 👋")
+        if _viz_proc:
+            _viz_proc.terminate()
+        print("\nBye!")
         sys.exit(0)
 
 
